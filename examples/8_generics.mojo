@@ -1,5 +1,5 @@
 @value  # derives `__init__`, `__copyinit__`, `__moveinit__` for you.
-struct MyStack[T: CollectionElement]:
+struct MyStack[T: Copyable & Movable]:
     var list: List[T]
 
     fn pop(mut self) -> T:

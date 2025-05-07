@@ -2,21 +2,21 @@
 
 
 trait StackLike:
-    alias EltType: CollectionElement  # A type that implements CollectionElement
+    alias EltType: Copyable & Movable  # A type that implements CollectionElement
 
     fn pop(mut self) -> Self.EltType:
         ...
 
 
 @value  # derives `__init__`, `__copyinit__`, `__moveinit__` for you.
-struct MyStack[T: CollectionElement](StackLike):
+struct MyStack[T: Copyable & Movable](StackLike):
     alias EltType = T
     var list: List[T]
 
     fn pop(mut self) -> Self.EltType:
         return self.list.pop()
 
-    fn dump[U: RepresentableCollectionElement](self: MyStack[U]):
+    fn dump[U: Representable & Copyable & Movable](self: MyStack[U]):
         """Make use of conditional conformance here.
 
         If our type T conforms to U, then this is a callable method. It's not required
