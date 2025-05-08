@@ -1,4 +1,4 @@
-def create_greeting(name, *, cordial_msg=""):
+def create_greeting(name: String, *, cordial_msg: String="") -> String:
     """`def` functions don't require type declarations, undeclared types are just `object`.
 
     `def` function arguments are mutable and follow the Python convention of "pass by object reference".
