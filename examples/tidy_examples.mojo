@@ -313,7 +313,22 @@ fn bench_gpu(
     dev_output.enqueue_copy_to(host_output)
     ctx.synchronize()
     if host_output[0] != expected_count:
-        raise "Invalid GPU output"
+        raise "Invalid GPU output base impl"
+
+    dev_output = dev_output.enqueue_fill(0)
+    ctx.enqueue_function[
+        count_nuc_content_gpu_shuffle[block_size, coarse_factor, G, C]
+    ](
+        dev_genome.unsafe_ptr(),
+        UInt(len(genome)),
+        dev_output.unsafe_ptr(),
+        grid_dim=ceildiv(len(genome), (coarse_factor * block_size)),
+        block_dim=block_size,
+    )
+    dev_output.enqueue_copy_to(host_output)
+    ctx.synchronize()
+    if host_output[0] != expected_count:
+        raise "Invalid GPU output for shuffle"
 
     @parameter
     @always_inline
