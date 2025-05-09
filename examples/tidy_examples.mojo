@@ -158,18 +158,6 @@ fn count_nuc_content_gpu[
     sequence_length: UInt,
     count_output: UnsafePointer[Scalar[DType.uint64]],
 ):
-    """GPU Kernel for doing GC counting in a sum-reduction pattern.
-
-    Args:
-        sequence: Pointer to the DNA sequence to do counts on.
-        sequence_length: Length of the DNA sequence.
-        count_output: Pointer to location to store the GC count.
-
-    Parameters:
-        block_size: The number of threads per block.
-        coarse_factor: Number of elements each thread to work though.
-        nucs: Variadic list of nucleotides to count.
-    """
     alias nucs_to_search = VariadicList(nucs)
     # Shared cache for this warp
     alias cache = stack_allocation[
@@ -211,6 +199,58 @@ fn count_nuc_content_gpu[
     # Finally, have the first thread in the warp set add to the global sum
     if t == 0:
         _ = Atomic.fetch_add(count_output, cache[t])
+
+
+fn count_nuc_content_gpu_shuffle[
+    block_size: UInt, coarse_factor: UInt, *nucs: UInt8
+](
+    sequence: UnsafePointer[Scalar[DType.uint8]],
+    sequence_length: UInt,
+    count_output: UnsafePointer[Scalar[DType.uint64]],
+):
+    """GPU Kernel for doing GC counting in a sum-reduction pattern.
+    Args:
+        sequence: Pointer to the DNA sequence to do counts on.
+        sequence_length: Length of the DNA sequence.
+        count_output: Pointer to location to store the GC count.
+    Parameters:
+        block_size: The number of threads per block.
+        coarse_factor: Number of elements each thread to work though.
+        nucs: Variadic list of nucleotides to count.
+    """
+    # Compile time constraint on block_size
+    constrained[block_size == 32, "Block size must equal warp size"]()
+
+    alias nucs_to_search = VariadicList(nucs)
+
+    # Each thread zeros its cache index
+    var segment = coarse_factor * 2 * block_dim.x * block_idx.x
+    var i = segment + thread_idx.x
+    var t = thread_idx.x
+    barrier()
+
+    var sum = UInt32(0)
+
+    @parameter
+    for tile in range(0, coarse_factor * 2):
+        var index = i + tile * block_size
+        if index < sequence_length:
+            var base = sequence[i + tile * block_size]
+
+            @parameter
+            for i in range(0, len(nucs_to_search)):
+                sum += UInt32(base == nucs_to_search[i])
+
+    alias offsets = InlineArray[UInt32, size=5](16, 8, 4, 2, 1)
+
+    # No more shared cache!
+    # This uses a shuffle, which passes a value 1 thread down
+    @parameter
+    for offset in range(0, len(offsets)):
+        sum += warp.shuffle_down(sum, offsets[offset])
+
+    if t == 0:
+        _ = Atomic.fetch_add(count_output, UInt64(sum))
 
 
 fn read_genome(read file: String) raises -> List[UInt8]:
@@ -286,6 +326,27 @@ fn bench_gpu(
 
     @parameter
     @always_inline
+    fn bench_gpu_shuffle[cf: UInt](mut b: Bencher) raises:
+        var f = ctx.compile_function[
+            count_nuc_content_gpu_shuffle[block_size, cf, G, C]
+        ]()
+
+        @parameter
+        @always_inline
+        fn kernel_launch(ctx: DeviceContext) raises:
+            ctx.enqueue_function(
+                f,
+                dev_genome.unsafe_ptr(),
+                UInt(len(genome)),
+                dev_output.unsafe_ptr(),
+                grid_dim=ceildiv(len(genome), (cf * block_size)),
+                block_dim=block_size,
+            )
+
+        b.iter_custom[kernel_launch](ctx)
+
+    @parameter
+    @always_inline
     fn bench_gpu_with_data_tx[cf: UInt](mut b: Bencher) raises:
         var f = ctx.compile_function[
             count_nuc_content_gpu[block_size, cf, G, C]
@@ -314,6 +375,9 @@ fn bench_gpu(
     )
     b.bench_function[bench_gpu_with_data_tx[32]](
         BenchId("GPU coarse factor " + String(32) + " w/ data tx"), bytes_
+    )
+    b.bench_function[bench_gpu_shuffle[32]](
+        BenchId("GPU shuffle coarse factor " + String(32)), bytes_
     )
 
 
