@@ -2,6 +2,7 @@ from algorithm import vectorize
 from benchmark import (
     Bench,
     Bencher,
+    BenchConfig,
     BenchId,
     BenchMetric,
     ThroughputMeasure,
@@ -14,7 +15,7 @@ from os import Atomic
 from sys import simdwidthof, argv, has_accelerator
 from time import perf_counter
 
-from gpu import barrier, warp
+from gpu import barrier
 from gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from gpu.id import block_dim, block_idx, thread_idx
 from gpu.memory import AddressSpace
@@ -65,9 +66,10 @@ fn count_nuc_content_manual[
             # [A, T, C, G] == [C, C, C, C] -> [False, False, True, False]
             var mask = vector == nuc_vector
             # [False, False, True, False] -> [0010]
-            var packed = pack_bits(mask)
-            # pop_count counts the number of 1 bits
-            count += Int(pop_count(packed))
+            # var packed = pack_bits(mask)
+            # # pop_count counts the number of 1 bits
+            # count += Int(pop_count(packed))
+            count += mask.reduce_bit_count()
 
     # The cleanup loop, to account for anything that doesn't fit in the SIMD vector
     for offset in range(aligned_end, len(sequence)):
@@ -113,21 +115,21 @@ fn count_nuc_content[
             # pack_bits only works on sizes that correspond to types
             # so in the vectorize cleanup where width=1 we need to handle
             # the count specially.
-            @parameter
-            if width == 1:
-                count += Int(mask)
-            else:
-                var packed = pack_bits(mask)
-                count += Int(pop_count(packed))
+            count += mask.reduce_bit_count()
+            # @parameter
+            # if width == 1:
+            #     count += Int(mask)
+            # else:
+            #     var packed = pack_bits(mask)
+            #     count += Int(pop_count(packed))
 
     vectorize[count_nucs, simd_width](len(sequence))
     # Calls the provided function like:
     # count_nucs[16](0)
-    # count_nucs[16](16)
-    # count_nucs[16](32)
-    # ...
     # And for the remainder, switch to SIMD width 1
-    # count_nucs[1](48)
+    # count_nucs[1](16)
+    # count_nucs[1](17)
+    # ...
 
     return count
 
@@ -211,60 +213,6 @@ fn count_nuc_content_gpu[
         _ = Atomic.fetch_add(count_output, cache[t])
 
 
-fn count_nuc_content_gpu_shuffle[
-    block_size: UInt, coarse_factor: UInt, *nucs: UInt8
-](
-    sequence: UnsafePointer[Scalar[DType.uint8]],
-    sequence_length: UInt,
-    count_output: UnsafePointer[Scalar[DType.uint64]],
-):
-    """GPU Kernel for doing GC counting in a sum-reduction pattern.
-
-    Args:
-        sequence: Pointer to the DNA sequence to do counts on.
-        sequence_length: Length of the DNA sequence.
-        count_output: Pointer to location to store the GC count.
-
-    Parameters:
-        block_size: The number of threads per block.
-        coarse_factor: Number of elements each thread to work though.
-        nucs: Variadic list of nucleotides to count.
-    """
-    # Compile time constraint on block_size
-    constrained[block_size == 32, "Block size must equal warp size"]()
-
-    alias nucs_to_search = VariadicList(nucs)
-
-    # Each thread zeros its cache index
-    var segment = coarse_factor * 2 * block_dim.x * block_idx.x
-    var i = segment + thread_idx.x
-    var t = thread_idx.x
-    barrier()
-
-    var sum = UInt32(0)
-
-    @parameter
-    for tile in range(0, coarse_factor * 2):
-        var index = i + tile * block_size
-        if index < sequence_length:
-            var base = sequence[i + tile * block_size]
-
-            @parameter
-            for i in range(0, len(nucs_to_search)):
-                sum += UInt32(base == nucs_to_search[i])
-
-    alias offsets = InlineArray[UInt32, size=5](16, 8, 4, 2, 1)
-
-    # No more shared cache!
-    # This uses a shuffle, which passes a value 1 thread down
-    @parameter
-    for offset in range(0, len(offsets)):
-        sum += warp.shuffle_down(sum, offsets[offset])
-
-    if t == 0:
-        _ = Atomic.fetch_add(count_output, UInt64(sum))
-
-
 fn read_genome(read file: String) raises -> List[UInt8]:
     var genome = List[UInt8](
         capacity=3209286105
@@ -313,49 +261,13 @@ fn bench_gpu(
     dev_output.enqueue_copy_to(host_output)
     ctx.synchronize()
     if host_output[0] != expected_count:
-        raise "Invalid GPU output base impl"
-
-    dev_output = dev_output.enqueue_fill(0)
-    ctx.enqueue_function[
-        count_nuc_content_gpu_shuffle[block_size, coarse_factor, G, C]
-    ](
-        dev_genome.unsafe_ptr(),
-        UInt(len(genome)),
-        dev_output.unsafe_ptr(),
-        grid_dim=ceildiv(len(genome), (coarse_factor * block_size)),
-        block_dim=block_size,
-    )
-    dev_output.enqueue_copy_to(host_output)
-    ctx.synchronize()
-    if host_output[0] != expected_count:
-        raise "Invalid GPU output for shuffle"
+        raise "Invalid GPU output"
 
     @parameter
     @always_inline
     fn bench_gpu[cf: UInt](mut b: Bencher) raises:
         var f = ctx.compile_function[
             count_nuc_content_gpu[block_size, cf, G, C]
-        ]()
-
-        @parameter
-        @always_inline
-        fn kernel_launch(ctx: DeviceContext) raises:
-            ctx.enqueue_function(
-                f,
-                dev_genome.unsafe_ptr(),
-                UInt(len(genome)),
-                dev_output.unsafe_ptr(),
-                grid_dim=ceildiv(len(genome), (cf * block_size)),
-                block_dim=block_size,
-            )
-
-        b.iter_custom[kernel_launch](ctx)
-
-    @parameter
-    @always_inline
-    fn bench_gpu_shuffle[cf: UInt](mut b: Bencher) raises:
-        var f = ctx.compile_function[
-            count_nuc_content_gpu_shuffle[block_size, cf, G, C]
         ]()
 
         @parameter
@@ -403,9 +315,6 @@ fn bench_gpu(
     b.bench_function[bench_gpu_with_data_tx[32]](
         BenchId("GPU coarse factor " + String(32) + " w/ data tx"), bytes_
     )
-    b.bench_function[bench_gpu_shuffle[32]](
-        BenchId("GPU shuffle coarse factor " + String(32)), bytes_
-    )
 
 
 def validate_methods(genome: Span[UInt8]) -> UInt:
@@ -448,7 +357,7 @@ def main():
 
     var expected_gc = validate_methods(genome)
 
-    var b = Bench()
+    var b = Bench(BenchConfig(num_repetitions=1))
     var bytes_ = ThroughputMeasure(BenchMetric.bytes, len(genome))
 
     @parameter
@@ -500,7 +409,7 @@ def main():
     b.bench_function[bench_vectorized[U8_SIMD_WIDTH * 2]](
         BenchId("Vectorized, width " + String(U8_SIMD_WIDTH * 2)), bytes_
     )
-    b.bench_function[bench_naive](BenchId("Naive"), bytes_)
+    # b.bench_function[bench_naive](BenchId("Naive"), bytes_)
 
     b.config.verbose_metric_names = False
     print(b)
