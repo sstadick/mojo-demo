@@ -15,7 +15,7 @@ from os import Atomic
 from sys import simdwidthof, argv, has_accelerator
 from time import perf_counter
 
-from gpu import barrier
+from gpu import barrier, warp
 from gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from gpu.id import block_dim, block_idx, thread_idx
 from gpu.memory import AddressSpace
@@ -66,10 +66,9 @@ fn count_nuc_content_manual[
             # [A, T, C, G] == [C, C, C, C] -> [False, False, True, False]
             var mask = vector == nuc_vector
             # [False, False, True, False] -> [0010]
-            # var packed = pack_bits(mask)
+            var packed = pack_bits(mask)
             # # pop_count counts the number of 1 bits
-            # count += Int(pop_count(packed))
-            count += mask.reduce_bit_count()
+            count += Int(pop_count(packed))
 
     # The cleanup loop, to account for anything that doesn't fit in the SIMD vector
     for offset in range(aligned_end, len(sequence)):
@@ -115,13 +114,12 @@ fn count_nuc_content[
             # pack_bits only works on sizes that correspond to types
             # so in the vectorize cleanup where width=1 we need to handle
             # the count specially.
-            count += mask.reduce_bit_count()
-            # @parameter
-            # if width == 1:
-            #     count += Int(mask)
-            # else:
-            #     var packed = pack_bits(mask)
-            #     count += Int(pop_count(packed))
+            @parameter
+            if width == 1:
+                count += Int(mask)
+            else:
+                var packed = pack_bits(mask)
+                count += Int(pop_count(packed))
 
     vectorize[count_nucs, simd_width](len(sequence))
     # Calls the provided function like:
